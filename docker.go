@@ -42,7 +42,7 @@ type DockerContainerConfig struct {
 	// Image is the Docker repository/image name (without tag). Defaults to
 	// "public.ecr.aws/docker/library/postgres" when empty.
 	//
-	// For locally-built images use the repository name passed to `docker build -t`:
+	// For locally built images use the repository name passed to `docker build -t`:
 	//   e.g. Image: "my-custom-postgres", Version: "17"
 	Image string
 

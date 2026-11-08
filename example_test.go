@@ -65,6 +65,32 @@ func ExampleStartPostgresContainer() {
 	_ = container.Port
 }
 
+// ExampleStartPostgresContainer_customImage demonstrates starting a container with a custom
+// locally built Docker image and PostgreSQL server startup flags (such as shared_preload_libraries).
+func ExampleStartPostgresContainer_customImage() {
+	dbName := "test_main_postgres"
+
+	// Start or reuse a container from a locally built image
+	container, teardown, err := pgtest.StartPostgresContainer(pgtest.DockerContainerConfig{
+		Image:          "custom-postgres",
+		Version:        "17",
+		DBName:         dbName,
+		ReuseContainer: true,
+		Expire:         3600,
+		Cmd: []string{
+			"-c", "shared_preload_libraries=pg_cron",
+			"-c", "cron.database_name=" + dbName,
+		},
+	})
+	if err != nil {
+		panic(err)
+	}
+	defer teardown()
+
+	_ = container.DB
+	_ = container.Port
+}
+
 // ExampleCreateDBTemplate demonstrates snapshotting the primary database into a template.
 func ExampleCreateDBTemplate() {
 	// Snapshot the current schema as a template for NewDB

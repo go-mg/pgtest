@@ -90,6 +90,41 @@
 // a fixed container named "pg-test-container". Successive test runs connect directly to the
 // running container rather than restarting Docker images, saving significant CPU and wall-clock time.
 //
+// # Custom Docker Images and Extensions
+//
+// By default, pgtest uses the official PostgreSQL Alpine image. When test suites require
+// specific PostgreSQL extensions (such as PostGIS, pg_cron, or pgvector), relying on third-party
+// images from Docker Hub can lead to broken pipelines due to abandoned repositories or missing
+// multi-architecture support (e.g. Apple Silicon arm64 vs Linux amd64).
+//
+// You can build a custom Docker image locally based on official Debian images ("postgres:<version>-bookworm"),
+// which have the PGDG apt repository preconfigured:
+//
+//	# Dockerfile.postgres
+//	FROM postgres:17-bookworm
+//	RUN apt-get update && apt-get install -y --no-install-recommends \
+//	    postgresql-17-postgis-3 \
+//	    postgresql-17-cron \
+//	    && rm -rf /var/lib/apt/lists/*
+//
+// Build it locally:
+//
+//	docker build -f Dockerfile.postgres -t custom-postgres:17 .
+//
+// And configure [DockerContainerConfig] to use the local image and pass startup flags via Cmd:
+//
+//	dbName := "test_main_postgres"
+//	container, teardown, err := pgtest.StartPostgresContainer(pgtest.DockerContainerConfig{
+//		Image:          "custom-postgres",
+//		Version:        "17",
+//		DBName:         dbName,
+//		ReuseContainer: true,
+//		Cmd: []string{
+//			"-c", "shared_preload_libraries=pg_cron",
+//			"-c", "cron.database_name=" + dbName,
+//		},
+//	})
+//
 // # Safety and Garbage Collection
 //
 // In the event of process termination, crashes, or aborted debugging sessions:

@@ -180,6 +180,71 @@ func NewDB(t *testing.T, dbName string) *sql.DB
 4. **Connection Pool**: Establishes a new `*sql.DB` connection pool to the test database and validates connectivity with `PingContext`.
 5. **Automatic Cleanup**: Registers a `t.Cleanup()` callback to close the pool and drop the test database when the test ends.
 
+## Custom Images & Extensions
+
+Relying on third-party images from Docker Hub that package PostgreSQL with plugins (like PostGIS or pg_cron) can be fragile: community repositories often become unmaintained, disappear unexpectedly, or lack native multi-architecture support (`arm64` and `amd64`).
+
+The recommended approach is to build a minimal, custom Docker image based on the official PostgreSQL Debian image (`postgres:<version>-bookworm`), which comes with the official PostgreSQL Global Development Group (PGDG) apt repository preconfigured.
+
+### 1. Create a `Dockerfile.postgres`
+
+```dockerfile
+FROM postgres:17-bookworm
+
+# The official Debian-based postgres images have the PGDG apt repository pre-configured,
+# allowing straightforward installation of extensions such as PostGIS and pg_cron.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        postgresql-17-postgis-3 \
+        postgresql-17-cron \
+    && rm -rf /var/lib/apt/lists/*
+```
+
+### 2. Build the Docker Image Locally
+
+Build and tag your custom image before running your tests:
+
+```bash
+docker build -f Dockerfile.postgres -t custom-postgres:17 .
+```
+
+### 3. Configure `StartPostgresContainer`
+
+Configure `Image` and `Version` in `DockerContainerConfig` with the local repository name and tag. Pass any required server startup flags (such as `shared_preload_libraries`) via `Cmd`:
+
+```go
+func TestMain(m *testing.M) {
+    dbName := "test_main_postgres"
+
+    container, teardown, err := pgtest.StartPostgresContainer(pgtest.DockerContainerConfig{
+        Image:          "custom-postgres",
+        Version:        "17",
+        DBName:         dbName,
+        ReuseContainer: true,
+        Expire:         3600,
+        Cmd: []string{
+            "-c", "shared_preload_libraries=pg_cron",
+            "-c", "cron.database_name=" + dbName,
+        },
+    })
+    if err != nil {
+        panic(err)
+    }
+    defer teardown()
+
+    // Run schema migrations and enable required extensions
+    // _, err = container.DB.Exec("CREATE EXTENSION IF NOT EXISTS postgis;")
+    // _, err = container.DB.Exec("CREATE EXTENSION IF NOT EXISTS pg_cron;")
+
+    // Snapshot the database into the template for test isolation
+    if err = pgtest.CreateDBTemplate(); err != nil {
+        panic(err)
+    }
+
+    os.Exit(m.Run())
+}
+```
+
 ## Container Reuse
 
 ### Why Reuse?
