@@ -1,31 +1,3 @@
-// Package pgtest provides test helpers for spinning up isolated PostgreSQL
-// databases backed by a Docker container.
-//
-// # Typical usage in TestMain
-//
-//	func TestMain(m *testing.M) {
-//		container, teardown, err := pgtest.StartPostgresContainer(pgtest.DockerContainerConfig{
-//			Version:        "15-alpine",
-//			ReuseContainer: true,
-//		})
-//		if err != nil {
-//			panic(err)
-//		}
-//
-//		// Run migrations against the main database here, before creating the template.
-//		// e.g.: runMigrations(container.DB)
-//
-//		if err = pgtest.CreateDBTemplate(); err != nil {
-//			panic(err)
-//		}
-//
-//		_ = container
-//		code := m.Run()
-//		teardown()
-//		os.Exit(code)
-//	}
-//
-// Each test then calls [NewDB] to get its own isolated database cloned from the template.
 package pgtest
 
 import (
@@ -45,7 +17,21 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// dbOpsMu synchronizes administrative database operations (DROP/CREATE DATABASE)
+// across parallel tests within the same test process.
 var dbOpsMu sync.Mutex
+
+// sharedPrimaryDB is the connection pool to the primary test database created during setup.
+// Initialized by [StartPostgresContainer] before [CreateDBTemplate] is called.
+var sharedPrimaryDB *sql.DB
+
+// sharedPrimaryDSN stores the connection DSN for the primary database.
+// Used as a base URL to derive per-test connection strings by swapping the database name.
+var sharedPrimaryDSN string
+
+// nonAlphaNumRegex matches any character that is not an ASCII letter, digit, or underscore.
+// Used to sanitize arbitrary test names into valid PostgreSQL identifiers.
+var nonAlphaNumRegex = regexp.MustCompile(`\W`)
 
 func isRetryableDBErr(err error) bool {
 	if err == nil {
@@ -81,46 +67,31 @@ func retryDBOp(maxAttempts int, op func() error) error {
 	return lastErr
 }
 
-// concurrentConn is the shared "mother-connection" pool used to create and drop
-// per-test databases. It is intentionally a package-level variable: tests run in
-// separate processes (one per package), so there is no cross-package sharing.
-// It is set by [StartPostgresContainer] and must be initialized before calling [NewDB].
-var concurrentConn *sql.DB
-
-// concurrentConnDSN stores the connection string used by concurrentConn so we
-// can derive per-test DSNs by swapping the database name. sql.DB does not
-// expose its original DSN.
-var concurrentConnDSN string
-
-// nonAlphaRegex matches any character that is not a letter, digit, or underscore.
-// Used to sanitize arbitrary test names into valid PostgreSQL identifiers.
-var nonAlphaRegex = regexp.MustCompile(`[\W]`)
-
-// NewDB creates a fresh database named after the sanitized dbName and returns a
-// connection pool to it. The database is cloned from the template created by
-// [CreateDBTemplate], so it already contains the schema and any seed data applied
-// before the template was snapshotted.
+// NewDB provisions an isolated database cloned from the template snapshot created by
+// [CreateDBTemplate] and returns an active [*sql.DB] connection pool to it.
 //
-// The database is automatically dropped when the test finishes via [testing.T.Cleanup].
+// The database is uniquely identified by the sanitized dbName (e.g. passing t.Name()).
+// When the test finishes, [testing.T.Cleanup] automatically closes the connection pool,
+// terminates any lingering connections, and drops the test database.
 //
 // Prerequisites:
-//   - [StartPostgresContainer] must have been called (sets the internal connection).
-//   - [CreateDBTemplate] must have been called after any desired migrations.
+//   - [StartPostgresContainer] must have been called in TestMain.
+//   - [CreateDBTemplate] must have been called in TestMain after running migrations.
 func NewDB(t *testing.T, dbName string) *sql.DB {
 	t.Helper()
 
-	require.NotNil(t, concurrentConnDB,
-		"concurrentConnDB is nil: call pgtest.StartPostgresContainer() in TestMain before using NewDB")
+	require.NotNil(t, sharedAdminDB,
+		"sharedAdminDB is nil: call pgtest.StartPostgresContainer() in TestMain before using NewDB")
 
 	require.NotEmpty(t, dbName,
 		"dbName must not be empty")
 
-	dbName = nonAlphaRegex.ReplaceAllString(strings.ToLower(dbName), "_")
+	dbName = nonAlphaNumRegex.ReplaceAllString(strings.ToLower(dbName), "_")
 
-	adminPool := concurrentConnDB
+	adminPool := sharedAdminDB
 
-	templateDBName, err := dbNameFromDSN(concurrentConnDSN)
-	require.NoError(t, err, "failed to extract database name from concurrent connection DSN")
+	templateDBName, err := dbNameFromDSN(sharedPrimaryDSN)
+	require.NoError(t, err, "failed to extract database name from primary DSN")
 
 	templateName := fmt.Sprintf("%s_template", templateDBName)
 
@@ -146,7 +117,7 @@ func NewDB(t *testing.T, dbName string) *sql.DB {
 	})
 	require.NoError(t, err, "failed to create test database %q from template %q", dbName, templateName)
 
-	newConnString, err := replaceDatabaseInDSN(concurrentConnDSN, dbName)
+	newConnString, err := replaceDatabaseInDSN(sharedPrimaryDSN, dbName)
 	require.NoError(t, err, "failed to build connection string for test database %q", dbName)
 
 	newDB, err := sql.Open("postgres", newConnString)

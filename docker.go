@@ -16,91 +16,97 @@ import (
 )
 
 const (
-	// reusableContainerName is a fixed name so multiple test packages can share
-	// the same running container instead of each spinning up their own.
+	// reusableContainerName is a fixed container name allowing multiple test packages
+	// to share the same running container instead of spinning up duplicate instances.
 	reusableContainerName        = "pg-test-container"
 	postgresDefaultDB            = "postgres"
 	defaultPostgresDockerVersion = "17.4-alpine"
 	defaultDockerImage           = "public.ecr.aws/docker/library/postgres"
 )
 
-// DockerContainerConfig holds the options for [StartPostgresContainer].
+// DockerContainerConfig holds configuration options for [StartPostgresContainer].
 type DockerContainerConfig struct {
 	// ReuseContainer keeps the container alive between test runs and shares it
 	// across packages running in parallel. Useful for faster local development.
-	// When false, the container is removed after teardown.
+	// When false, the container is removed during teardown.
 	ReuseContainer bool
 
 	// DBName is the name of the primary PostgreSQL database created inside the
 	// container. If empty, a unique name is generated automatically.
 	DBName string
 
-	// Version is the Postgres Docker image tag (e.g. "15-alpine").
-	// Defaults to "15-alpine" when empty.
+	// Version is the Postgres Docker image tag (e.g. "17.4-alpine").
+	// Defaults to "17.4-alpine" when empty.
 	Version string
 
 	// Image is the Docker repository/image name (without tag). Defaults to
-	// public.ecr.aws/docker/library/postgres when empty.
+	// "public.ecr.aws/docker/library/postgres" when empty.
 	//
-	// For locally-built images use the repository name used in `docker build -t`:
-	//   e.g. Image: "zeus-postgis-cron", Version: "17"
+	// For locally-built images use the repository name passed to `docker build -t`:
+	//   e.g. Image: "my-custom-postgres", Version: "17"
 	Image string
 
 	// Expire sets a hard TTL (in seconds) on the container. This is a safety net
-	// for situations where the process is killed before teardown runs (e.g. during
-	// debugging). Zero means no expiry.
+	// for situations where the test process terminates unexpectedly before teardown runs.
+	// Zero means no expiry.
 	Expire uint
 
 	// Cmd is an optional list of arguments passed directly to the container's
-	// entrypoint (the `postgres` binary). This is the canonical way to set
-	// server-level parameters that must be present at startup, such as
+	// entrypoint (the `postgres` binary). This is the canonical way to configure
+	// server-level parameters that must be set at startup, such as
 	// `shared_preload_libraries`. Each item should be supplied as a separate
-	// `-c`/value pair:
+	// flag and value:
 	//
 	//   Cmd: []string{"-c", "shared_preload_libraries=pg_cron", "-c", "cron.database_name=test_main_postgres"}
 	Cmd []string
 }
 
-// instances is used to generate unique database names when DBName is not provided.
-var instances int32
+// dbInstanceSeq generates monotonically increasing sequence numbers for unique database names.
+var dbInstanceSeq int32
 
-// concurrentConnDB is a connection to the default "postgres" database used to
-// issue CREATE DATABASE / DROP DATABASE commands. We keep it separate from
-// concurrentConn because PostgreSQL forbids running CREATE DATABASE ... TEMPLATE
-// from a session that is connected to (or has any open session against) the
-// template source database.
-var concurrentConnDB *sql.DB
+// sharedAdminDB is the administrative connection pool connected to the default "postgres" database.
+// Used to execute CREATE DATABASE and DROP DATABASE statements outside active target sessions.
+var sharedAdminDB *sql.DB
 
-// concurrentContainerID is the Docker container ID of the running Postgres
-// container. It is necessary by [CreateDBTemplate] to run pg_dump/psql inside the
-// container, since the host is not required to have the PostgreSQL client tools.
-var concurrentContainerID string
+// sharedContainerID is the Docker container ID of the running PostgreSQL container.
+// Required by [CreateDBTemplate] to execute pg_dump and psql inside the container.
+var sharedContainerID string
 
-// DockerizedPostgres holds the connection pool and exposed port of the running container.
+// DockerizedPostgres holds the exposed database connection pool and host port for the running container.
 type DockerizedPostgres struct {
 	// DB is connected to the primary database created inside the container.
+	// Use this connection pool to run migrations before calling [CreateDBTemplate].
 	DB *sql.DB
 
-	// Port is the host-side TCP port mapped to 5432 inside the container.
+	// Port is the host-side TCP port mapped to container port 5432.
 	Port string
 }
 
 // StartPostgresContainer starts (or reuses) a PostgreSQL Docker container and
-// creates the primary database specified in cfg. It sets the internal
-// concurrentConn used by [NewDB] and [CreateDBTemplate].
+// creates the primary database specified in cfg. It initializes internal shared connections
+// used by [NewDB] and [CreateDBTemplate].
 //
-// The returned teardownFn must be called (typically via defer) to close
-// connections and, when ReuseContainer is false, remove the container.
+// The returned teardown function must be called when testing finishes (typically via defer
+// or after m.Run() in TestMain) to close connections and, if ReuseContainer is false, remove the container.
 //
-// Intended to be called once in TestMain, before running migrations and before
-// calling [CreateDBTemplate].
+// Intended to be called once in TestMain, before running migrations and before calling [CreateDBTemplate].
+//
+// Example:
 //
 //	func TestMain(m *testing.M) {
-//		_, teardown, err := pgtest.StartPostgresContainer(pgtest.DockerContainerConfig{...})
-//		if err != nil { panic(err) }
+//		container, teardown, err := pgtest.StartPostgresContainer(pgtest.DockerContainerConfig{
+//			Version:        "17.4-alpine",
+//			ReuseContainer: true,
+//		})
+//		if err != nil {
+//			panic(err)
+//		}
 //		defer teardown()
-//		// run migrations here...
-//		if err = pgtest.CreateDBTemplate(); err != nil { panic(err) }
+//
+//		// run migrations on container.DB...
+//		if err = pgtest.CreateDBTemplate(); err != nil {
+//			panic(err)
+//		}
 //		os.Exit(m.Run())
 //	}
 func StartPostgresContainer(cfg DockerContainerConfig) (dockerPostgres *DockerizedPostgres, teardownFn func(), err error) {
@@ -118,8 +124,8 @@ func StartPostgresContainer(cfg DockerContainerConfig) (dockerPostgres *Dockeriz
 	}
 
 	if cfg.DBName == "" {
-		atomic.AddInt32(&instances, 1)
-		cfg.DBName = fmt.Sprintf("db_%d_%d", time.Now().UnixNano(), atomic.LoadInt32(&instances))
+		atomic.AddInt32(&dbInstanceSeq, 1)
+		cfg.DBName = fmt.Sprintf("db_%d_%d", time.Now().UnixNano(), atomic.LoadInt32(&dbInstanceSeq))
 	}
 
 	if cfg.Image == "" {
@@ -177,11 +183,11 @@ func StartPostgresContainer(cfg DockerContainerConfig) (dockerPostgres *Dockeriz
 	}
 
 	// Expose the pool globally so NewDB and CreateDBTemplate can use it.
-	concurrentConn = primaryDB
-	concurrentConnDSN = primaryConnString
-	concurrentConnDB = defaultDB
+	sharedPrimaryDB = primaryDB
+	sharedPrimaryDSN = primaryConnString
+	sharedAdminDB = defaultDB
 	if dockerResource.Container != nil {
-		concurrentContainerID = dockerResource.Container.ID
+		sharedContainerID = dockerResource.Container.ID
 	}
 
 	teardownFn = func() {
@@ -209,27 +215,26 @@ func StartPostgresContainer(cfg DockerContainerConfig) (dockerPostgres *Dockeriz
 //
 // Implementation note: the snapshot is taken with pg_dump piped into psql
 // (both executed inside the container) instead of CREATE DATABASE ... TEMPLATE.
-// PostgreSQL refuses to clone a database that still has an open session, and
-// some sessions cannot be terminated — notably the pg_cron scheduler, which
-// permanently owns cron.database_name and reconnects automatically. pg_cron is
-// excluded from the dump because it can only be installed in its configured
-// database, so the extension objects cannot be restored into the template.
+// PostgreSQL refuses to clone a database that still has open sessions, and
+// background workers (such as pg_cron scheduler) maintain persistent connections.
+// Extensions like pg_cron are excluded from the dump because they cannot be cloned
+// into auxiliary template databases.
 func CreateDBTemplate() error {
-	if concurrentConn == nil || concurrentConnDB == nil {
-		return fmt.Errorf("concurrent connections are nil: call StartPostgresContainer() before CreateDBTemplate()")
+	if sharedPrimaryDB == nil || sharedAdminDB == nil {
+		return fmt.Errorf("shared database connections are nil: call StartPostgresContainer() before CreateDBTemplate()")
 	}
-	if concurrentContainerID == "" {
-		return fmt.Errorf("container id is empty: call StartPostgresContainer() before CreateDBTemplate()")
+	if sharedContainerID == "" {
+		return fmt.Errorf("container ID is empty: call StartPostgresContainer() before CreateDBTemplate()")
 	}
 
-	dbName, err := dbNameFromDSN(concurrentConnDSN)
+	dbName, err := dbNameFromDSN(sharedPrimaryDSN)
 	if err != nil {
 		return fmt.Errorf("failed to extract database name from DSN: %w", err)
 	}
 	templateName := fmt.Sprintf("%s_template", dbName)
 
 	if err = retryDBOp(5, func() error {
-		_, dropErr := concurrentConnDB.ExecContext(context.Background(),
+		_, dropErr := sharedAdminDB.ExecContext(context.Background(),
 			fmt.Sprintf("DROP DATABASE IF EXISTS %s WITH (FORCE)", templateName),
 		)
 		return dropErr
@@ -240,7 +245,7 @@ func CreateDBTemplate() error {
 	// Create the template from template0 so it starts empty and without any
 	// inherited sessions, then load the snapshot into it.
 	if err = retryDBOp(5, func() error {
-		_, createErr := concurrentConnDB.ExecContext(context.Background(),
+		_, createErr := sharedAdminDB.ExecContext(context.Background(),
 			fmt.Sprintf("CREATE DATABASE %s TEMPLATE template0", templateName),
 		)
 		return createErr
@@ -248,7 +253,7 @@ func CreateDBTemplate() error {
 		return fmt.Errorf("failed to create empty template database %q: %w", templateName, err)
 	}
 
-	if err = snapshotDatabase(concurrentContainerID, dbName, templateName); err != nil {
+	if err = snapshotDatabase(sharedContainerID, dbName, templateName); err != nil {
 		return fmt.Errorf("failed to snapshot database %q into %q: %w", dbName, templateName, err)
 	}
 
@@ -300,9 +305,9 @@ func snapshotDatabase(containerID, srcDB, dstDB string) error {
 // [dockertest.Pool.RunWithOptions] (and therefore has its internal pool set,
 // so methods like Expire are safe to call). It is false when the returned
 // resource wraps an already-running container and the internal pool is nil.
-func getDockerPostgresResource(dockerPool *dockertest.Pool, config DockerContainerConfig) (*dockertest.Resource, bool, error) {
+func getDockerPostgresResource(dockerPool *dockertest.Pool, cfg DockerContainerConfig) (*dockertest.Resource, bool, error) {
 	var containerName string
-	if config.ReuseContainer {
+	if cfg.ReuseContainer {
 		containerName = reusableContainerName
 		container, inspectErr := dockerPool.Client.InspectContainer(containerName)
 		if inspectErr == nil && container != nil && container.State.Running {
@@ -315,10 +320,10 @@ func getDockerPostgresResource(dockerPool *dockertest.Pool, config DockerContain
 
 	resource, runErr := dockerPool.RunWithOptions(&dockertest.RunOptions{
 		Name:       containerName,
-		Repository: config.Image,
-		Tag:        config.Version,
-		Env:        []string{"POSTGRES_USER=postgres", "POSTGRES_PASSWORD=postgres", "POSTGRES_DB=" + config.DBName},
-		Cmd:        config.Cmd,
+		Repository: cfg.Image,
+		Tag:        cfg.Version,
+		Env:        []string{"POSTGRES_USER=postgres", "POSTGRES_PASSWORD=postgres", "POSTGRES_DB=" + cfg.DBName},
+		Cmd:        cfg.Cmd,
 	}, func(c *docker.HostConfig) {
 		c.AutoRemove = true
 		c.RestartPolicy = docker.RestartPolicy{Name: "no"}
@@ -327,7 +332,7 @@ func getDockerPostgresResource(dockerPool *dockertest.Pool, config DockerContain
 		return resource, true, nil
 	}
 
-	if config.ReuseContainer {
+	if cfg.ReuseContainer {
 		var container *docker.Container
 		if retryErr := dockerPool.Retry(func() error {
 			var inspectErr error
@@ -345,7 +350,7 @@ func getDockerPostgresResource(dockerPool *dockertest.Pool, config DockerContain
 	}
 
 	return nil, false, fmt.Errorf("failed to start postgres container (image=%s:%s): %w",
-		config.Image, config.Version, runErr)
+		cfg.Image, cfg.Version, runErr)
 }
 
 // pingPostgresFn returns a retry-able function that attempts a single connection
