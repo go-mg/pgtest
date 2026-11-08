@@ -1,5 +1,6 @@
 # pgtest
 
+[![CI](https://github.com/go-mg/pgtest/actions/workflows/ci.yml/badge.svg)](https://github.com/go-mg/pgtest/actions/workflows/ci.yml)
 [![Go Reference](https://pkg.go.dev/badge/github.com/go-mg/pgtest.svg)](https://pkg.go.dev/github.com/go-mg/pgtest)
 [![Go Report Card](https://goreportcard.com/badge/github.com/go-mg/pgtest)](https://goreportcard.com/report/github.com/go-mg/pgtest)
 [![License](https://img.shields.io/github/license/go-mg/pgtest.svg)](LICENSE)
